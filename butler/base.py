@@ -16,7 +16,6 @@ def start_service(host, port, service, request_handler):
     request_handler: request handler for the TCP-Server, must subclass `BaseRequestHandler`
     """
     assert isinstance(service, BaseService)
-    assert isinstance(request_handler, BaseRequestHandler)
     server = ThreadingTCPServer((host, port), request_handler)
     # add the service to the server to access it for requests
     server.service = service
@@ -85,13 +84,11 @@ class BaseClient(object):
     Base client.
     Must override `format_request` and `format_response`.
     """
-    request = "1"
-
     def __init__(self, host, port):
         self.host = host
         self.port = port
 
-    def format_request(self, response):
+    def format_request(self, request):
         """
         Format incoming request.
         Must return string.
@@ -104,7 +101,7 @@ class BaseClient(object):
         """
         raise AttributeError("BaseClient does not implement format response")
 
-    def request(self, request):
+    def request(self, request=None):
         with socket.create_connection((self.host, self.port)) as sock:
             sock.sendall(bytes(self.format_request(request) + '\n', 'utf-8'))
             response = self.format_response(str(sock.recv(1024), 'utf-8'))

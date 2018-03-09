@@ -2,12 +2,12 @@ import os
 import json
 import threading
 import time
-from collection import deque
+from collections import deque
 
-from ..base import BaseRequestHandler, BaseService
+from ..base import BaseRequestHandler, BaseService, BaseClient
 
 
-class BaseRequestHandler(BaseRequestHandler):
+class BlockRequestHandler(BaseRequestHandler):
     """
     BlockRequestHandler
     """
@@ -42,7 +42,7 @@ class BaseRequestHandler(BaseRequestHandler):
             response = "stop"
         else:
             raise RuntimeError("Invalid response")
-        return bytes(response + "\n", "utf8")
+        return response
 
 
 class BlockService(BaseService):
@@ -56,7 +56,7 @@ class BlockService(BaseService):
                  check_interval=60, num_retries=2, out_path=None):
 
         # initialize the base class
-        super(BaseService, self).__init__(logger)
+        super(BlockService, self).__init__(logger)
         self.logger.info("Init BlockService:")
 
         # time limit and check interval;
@@ -113,7 +113,7 @@ class BlockService(BaseService):
             time.sleep(self.check_interval)
             with self.lock:
                 now = time.time()
-                self.logger.debug("checking progress list for %i blocks" % len(self.time_steps))
+                self.logger.debug("checking progress list for %i blocks" % len(self.time_stamps))
                 # find blocks that have exceeded the time limit
                 failed_block_ids = [ii for ii, time_stamp in enumerate(self.time_stamps)
                                     if now - time_stamp > self.time_limit]
@@ -137,9 +137,9 @@ class BlockService(BaseService):
             else:
                 # check if we still repopulate, otherwise
                 # return `None` and initiate shutdowns
-                if self.try_counter < self.num_retries:
+                if self.try_counter < self.num_retries and self.failed_blocks:
                     self.logger.info("exhausted block queue, repopulating for %i time" % self.try_counter)
-                    self.repopulate_queue()
+                    block_offsets = self.repopulate_queue()
                     self.try_counter += 1
                 else:
                     self.logger.info("exhausted block queue, shutting down service")
@@ -169,8 +169,36 @@ class BlockService(BaseService):
 
     def repopulate_queue(self):
         self.block_queue.extendleft(self.failed_blocks)
+        block_offsets = self.block_queue.pop()
+        self.in_progress.append(block_offsets)
+        self.time_stamps.append(time.time())
+        self.logger.debug("returning block offsets: %s" % str(block_offsets))
+        return block_offsets
 
     def serialize_failed_blocks(self):
         if self.out_path is not None:
             with open(self.out_path, 'w') as f:
                 json.dump(self.failed_blocks, f)
+
+
+class BlockClient(BaseClient):
+    """
+    """
+    def format_request(self, request):
+        """
+        Format incoming request.
+        Must return string.
+        """
+        return "1" if request is None else " ".join(map(str, request))
+
+    def format_response(self, response):
+        """
+        Format incoming response.
+        """
+        response = response.split()
+        # if the response has length 3, it consists of
+        # block coordinates
+        if len(response) == 3:
+            return list(map(int, response))
+        else:
+            return None if response is 'stop' else bool(int(response))

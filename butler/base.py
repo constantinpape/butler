@@ -63,7 +63,7 @@ class BaseService(object):
         self.logger = logger
         self.server = None  # must be monkey-patched
 
-    def process_request(self, response):
+    def process_request(self, request):
         """
         Process incoming request.
         """

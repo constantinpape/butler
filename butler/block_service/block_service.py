@@ -52,37 +52,38 @@ class BlockService(BaseService):
     blocks that are over the time limit.
     """
 
-    def __init__(self, block_file, logger, time_limit,
-                 check_interval=60, num_retries=2, out_path=None):
+    def __init__(self, block_file, time_limit,
+                 check_interval=60, num_retries=2, out_prefix=None):
 
         # initialize the base class
-        super(BlockService, self).__init__(logger)
-        self.logger.info("Init BlockService:")
+        super(BlockService, self).__init__()
+        self.logger.info(" Init BlockService:")
 
         # time limit and check interval;
         assert time_limit > check_interval
         self.time_limit = time_limit
         self.check_interval = check_interval
-        self.logger.info("with time_limit: %i and check_interval: %i" % (time_limit, check_interval))
+        self.logger.info(" time_limit: %i and check_interval: %i" % (time_limit, check_interval))
 
         # number of retries for failed blocks
         self.num_retries = num_retries
         self.try_counter = 0
-        self.logger.info("with num_retries: %i" % num_retries)
+        self.logger.info(" num_retries: %i" % num_retries)
 
         # the outpath to serialize failed blocks
-        self.out_path = out_path
-        if self.out_path is not None:
-            self.logger.info("will serialize failed blocks at: %s" % self.out_path)
+        self.out_prefix = out_prefix
+        if self.out_prefix is not None:
+            self.logger.info(" Will serialize failed blocks at: %s" % self.out_prefix)
         else:
-            self.logger.warn("will not serialize failed blocks")
+            self.logger.warn(" Will not serialize failed blocks, you can serialize them by passing argument `out_prefix`")
 
         # load the coordinates of the blocks that will be processed
         # make a queue containing all block offsets
         assert os.path.exists(block_file), block_file
         with open(block_file, 'r') as f:
             self.block_queue = deque(reversed(json.load(f)))
-        self.logger.info("loaded block list from: %s" % block_file)
+        self.logger.info(" Loaded block list from: %s" % block_file)
+        self.logger.info(" Added %i blocks to queue" % len(self.block_queue))
 
         # list to keep track of ids that are currently processed
         self.in_progress = []
@@ -94,12 +95,12 @@ class BlockService(BaseService):
         self.lock = threading.Lock()
 
         # start the background thread that checks for failed jobs
-        bg_thread = threading.Thread(target=self.check_progress_list, args=())
-        bg_thread.daemon = True
-        bg_thread.start()
+        self.bg_thread = threading.Thread(target=self.check_progress_list, args=())
+        self.bg_thread.daemon = True
+        self.bg_thread.start()
 
     def process_request(self, request):
-        self.logger.debug("process incomig request: %s" % str(request))
+        self.logger.debug(" Process incomig request: %s" % str(request))
         # request a new block
         if request is None:
             return self.request_block()
@@ -109,15 +110,15 @@ class BlockService(BaseService):
 
     # check the progress list for blocks that have exceeded the time limit
     def check_progress_list(self):
-        while True:
+        while self.server_is_running:
             time.sleep(self.check_interval)
             with self.lock:
                 now = time.time()
-                self.logger.debug("checking progress list for %i blocks" % len(self.time_stamps))
+                self.logger.debug(" Checking progress list for %i blocks" % len(self.time_stamps))
                 # find blocks that have exceeded the time limit
                 failed_block_ids = [ii for ii, time_stamp in enumerate(self.time_stamps)
                                     if now - time_stamp > self.time_limit]
-                self.logger.debug("found %i blocks over the time limit" % len(failed_block_ids))
+                self.logger.info(" Found %i blocks over the time limit" % len(failed_block_ids))
                 # remove failed blocks and time stamps from in progress and
                 # append failed blocks to the failed list
                 # NOTE: we need to iterate in reverse order to delete the correct elements
@@ -128,24 +129,43 @@ class BlockService(BaseService):
     # request the next block to be processed
     # if no more blocks are present, return None
     def request_block(self):
-        with self.lock:
-            if len(self.block_queue) > 0:
+
+        # return a block offset if we still have blocks in the quee
+        if len(self.block_queue) > 0:
+            with self.lock:
                 block_offsets = self.block_queue.pop()
                 self.in_progress.append(block_offsets)
                 self.time_stamps.append(time.time())
-                self.logger.debug("returning block offsets: %s" % str(block_offsets))
-            else:
-                # check if we still repopulate, otherwise
-                # return `None` and initiate shutdowns
-                if self.try_counter < self.num_retries and self.failed_blocks:
-                    self.logger.info("exhausted block queue, repopulating for %i time" % self.try_counter)
+                self.logger.debug(" Returning block offsets: %s" % str(block_offsets))
+
+        # otherwise, wait for the ones in progress to finish (or be cancelled)
+        # then either repopulate, or exit
+        else:
+
+            # NOTE this must not be locked, otherwise
+            # we end up with a deadlock with the lock in `check_progress_list`
+            while self.in_progress:
+                time.sleep(self.check_interval)
+                continue
+
+            with self.lock:
+                # we need to check again inf the block queue is empty, because it might have been repopulated
+                # in the meantime already
+                if len(self.block_queue) > 0:
+                    block_offsets = self.block_queue.pop()
+                    self.in_progress.append(block_offsets)
+                    self.time_stamps.append(time.time())
+                    self.logger.debug(" Returning block offsets: %s" % str(block_offsets))
+                elif self.try_counter < self.num_retries and self.failed_blocks:
+                    self.logger.info(" Exhausted block queue, repopulating for %i time" % self.try_counter)
                     block_offsets = self.repopulate_queue()
                     self.try_counter += 1
                 else:
-                    self.logger.info("exhausted block queue, shutting down service")
                     block_offsets = None
-                    self.serialize_failed_blocks()
-                    self.shutdown_server()
+                    if self.server_is_running:
+                        self.logger.info(" Exhausted block queue, shutting down service")
+                        self.serialize_status()
+                        self.shutdown_server()
         return block_offsets
 
     # confirm that a block has been processed
@@ -154,31 +174,59 @@ class BlockService(BaseService):
         # list and remove it.
         # if not, the time limit was exceeded and something is most likely wrong
         # with the block and the block was put on the failed block list
+        self.logger.debug(" Confirming block %s" % str(block_offset))
         try:
-            index = self.in_progress.index(block_offset)
             with self.lock:
+                index = self.in_progress.index(block_offset)
                 del self.in_progress[index]
                 del self.time_stamps[index]
                 self.processed_list.append(block_offset)
             success = True
-            self.logger.debug("block offsets %s were confirmed" % str(block_offset))
+            self.logger.debug(" Block %s was processed properly." % str(block_offset))
         except ValueError:
             success = False
-            self.logger.debug("block offsets %s were not confirmed" % str(block_offset))
+            self.logger.debug(" Block %s is over time limit and was added to failed blocks" % str(block_offset))
         return success
 
     def repopulate_queue(self):
         self.block_queue.extendleft(self.failed_blocks)
+        self.failed_blocks = []
         block_offsets = self.block_queue.pop()
         self.in_progress.append(block_offsets)
         self.time_stamps.append(time.time())
-        self.logger.debug("returning block offsets: %s" % str(block_offsets))
+        self.logger.debug(" Returning block offsets: %s" % str(block_offsets))
         return block_offsets
 
-    def serialize_failed_blocks(self):
-        if self.out_path is not None:
-            with open(self.out_path, 'w') as f:
-                json.dump(self.failed_blocks, f)
+    def serialize_status(self, from_interrupt=False):
+        """
+        Serialize the status (failed blocks, processed blocks, in-progress blocks)
+        """
+        if from_interrupt:
+            self.logger.info(" serialize_status called after interrupt")
+        else:
+            self.logger.info(" serialize_status called after regular shutdown")
+
+        if self.out_prefix is not None:
+            if self.failed_blocks:
+                out_failed_blocks = self.out_prefix + "failed_blocks.json"
+                self.logger.info(" Serialized list of failed blocks with %i entries to %s" %
+                                 (len(self.failed_blocks), out_failed_blocks))
+                with open(out_failed_blocks, 'w') as f:
+                    json.dump(self.failed_blocks, f)
+
+            if self.processed_list:
+                out_processed_blocks = self.out_prefix + "processed_blocks.json"
+                self.logger.info(" Serialized list of processed blocks with %i entries to %s" %
+                                 (len(self.processed_list), out_processed_blocks))
+                with open(out_processed_blocks, 'w') as f:
+                    json.dump(self.processed_list, f)
+
+            if self.in_progress:
+                out_in_progress = self.out_prefix + "inprogress_blocks.json"
+                self.logger.info(" Serialized list of in-progress blocks with %i entries to %s" %
+                                 (len(self.in_progress), out_in_progress))
+                with open(self.out_prefix + "inprogress_blocks.json", 'w') as f:
+                    json.dump(self.in_progress, f)
 
 
 class BlockClient(BaseClient):
@@ -201,4 +249,5 @@ class BlockClient(BaseClient):
         if len(response) == 3:
             return list(map(int, response))
         else:
+            response = response[0]
             return None if response is 'stop' else bool(int(response))

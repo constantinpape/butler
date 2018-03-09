@@ -1,5 +1,6 @@
 import socket
 import socketserver
+import logging
 
 
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -21,7 +22,15 @@ def start_service(host, port, service, request_handler):
     server.service = service
     # add the server to the service to call finish after all requests are processed
     service.server = server
-    server.serve_forever()
+    # wrap in a try except and serialize the current state on keyboard interrupt
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt as e:
+        service.serialize_status(True)
+        service.shutdown_server()
+        raise e
+    except Exception as e:
+        raise e
 
 
 class BaseRequestHandler(socketserver.StreamRequestHandler):
@@ -58,9 +67,10 @@ class BaseService(object):
     Must override `process_request`
     """
 
-    def __init__(self, logger):
-        self.logger = logger
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
         self.server = None  # must be monkey-patched
+        self.server_is_running = True
 
     def process_request(self, request):
         """
@@ -74,9 +84,20 @@ class BaseService(object):
         """
         if self.server is None:
             raise RuntimeError("Cannot call shutdown; invalid server")
-        self.logger.info("Shutting down connection to server %s:%i" % self.server.server_address)
+        self.logger.info(" Shutting down connection to server %s:%i" % self.server.server_address)
         self.server.shutdown()
         self.server.server_close()
+        self.server_is_running = False
+
+    def serialize_status(self, from_interrupt=False):
+        """
+        Serialize status of the service, default dummy implementation.
+        """
+        if from_interrupt:
+            self.logger.info(" serialize_status called after interrupt")
+        else:
+            self.logger.info(" serialize_status called after regular shutdown")
+        self.logger.info(" Base implementation - doing nothing")
 
 
 class BaseClient(object):

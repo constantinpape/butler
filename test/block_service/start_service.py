@@ -2,9 +2,10 @@ import os
 import sys
 import json
 import logging
+from shutil import rmtree
 
-# sys.path.append('/home/papec/Work/my_projects/z5/bld/python')
-sys.path.append('/home/papec/Work/software/bld/z5/python')
+sys.path.append('/home/papec/Work/my_projects/z5/bld/python')
+# sys.path.append('/home/papec/Work/software/bld/z5/python')
 sys.path.append('../..')
 
 
@@ -14,6 +15,10 @@ def setup():
     import z5py
     shape = (1000, 1000, 1000)
     chunks = (100, 100, 100)
+
+    if os.path.exists('./output.n5'):
+        rmtree('./output.n5')
+
     f = z5py.File('./output.n5')
     f.create_dataset('out', shape=shape, chunks=chunks, dtype='uint8', compression='gzip')
 
@@ -30,13 +35,12 @@ def setup():
 def start_service():
     from butler import start_service
     from butler.block_service import BlockService, BlockRequestHandler
-    if not os.path.exists('./output.n5'):
-        setup()
+    setup()
     host, port = "localhost", 9999
     block_list = './block_list.json'
-    logger = logging.getLogger("logger.BlockService")
-    logger.setLevel(logging.INFO)
-    service = BlockService(block_list, logger, 180)
+    # TODO properly set up logger
+    logging.basicConfig(level=logging.INFO)
+    service = BlockService(block_list, 20, 10, out_prefix='./service_status_')
     start_service(host, port, service, BlockRequestHandler)
 
 
